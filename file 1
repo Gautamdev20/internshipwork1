@@ -1,0 +1,156 @@
+import requests
+import psycopg2
+from datetime import datetime
+import logging
+import sys
+from investorholding_module import get_investorholdings
+import dotenv
+import os
+import time
+import getopt
+from dataroma_module import get_price
+
+dotenv.load_dotenv('.env')
+
+database = os.environ.get("DATABASE")
+user = os.environ.get("USER_DATABASE")
+password = os.environ.get("PASSWORD")
+host = os.environ.get("HOST")
+port = os.environ.get("PORT")
+openfigi_api_key = os.environ.get("OPEN_FIGI_KEY")
+
+today = datetime.today().strftime('%Y-%m-%d')
+
+
+headers = {'Content-Type': 'application/json', 'X-OPENFIGI-APIKEY': openfigi_api_key}
+
+
+def insert13f(cur, select_date):
+    selectDate = select_date
+
+    cur.execute(f"SELECT si_cik, si_company, cutoff_date, latest_checked_date FROM public.us_stock_superinvestor WHERE deleted='N'")
+    data = cur.fetchall()
+    for index in range(len(data)):
+        varCIK = data[index][0]
+        company = data[index][1]
+        cutoff_date = data[index][2]
+        latest_checked_date = data[index][3]
+
+        # if cutoff_date != 'nan' and cutoff_date <= selectDate:
+        #     continue
+
+        investorholdings_list = get_investorholdings(varCIK, company, select_date, cutoff_date, latest_checked_date)
+        print(len(investorholdings_list))
+        count = 0
+        for i in investorholdings_list:
+            cur.execute(f"SELECT ticker FROM public.figi_ref WHERE cusip='{i.cusip}'")
+            query = f'''INSERT INTO public.us_stock_investorholding(si_cik, ticker, company, filing_date, issuer_name, cusip, si_value, othermanager, sshprnamt, sshprnamttype, titleofclass, voteauthsole, voteauthshared, voteauthnone, insert_date, update_date, insert_by, update_by) VALUES({i.cik}, 'TICKER', '{i.company}', '{i.filingdate}', '{i.nameofissuer}','{i.cusip}', {i.value}, '{i.othermanager}', {i.sshprnamt}, '{i.sshprnamttype}', '{i.titleofclass}', {i.voteauthsole}, {i.voteauthshared}, {i.voteauthnone}, 'nan', 'nan', 'nan', 'nan');'''
+            try:
+                ticker = cur.fetchall()[0][0]
+                query = query.replace("TICKER", str(ticker))
+                cur.execute(query)
+                query_info_logger.info(f"Query executed -> {query}")
+                print(f"Query executed -> {query}")
+            except:
+                r = requests.post('https://api.openfigi.com/v3/mapping', json=[{"idType":"ID_CUSIP","idValue":i.cusip, "exchCode":"US"}], headers=headers)
+                r = r.json()
+                count += 1
+                if count == 15:
+                    count = 0
+                    time.sleep(6)
+                try:
+                    ticker = r[0]['data'][0]['ticker']
+                    query = query.replace("TICKER", str(ticker))
+                    cur.execute(query)
+                    query_info_logger.info(f"Query executed -> {query}")
+                    print(f"Query executed -> {query}")
+                    ref = r[0]['data'][0]
+                    compositeFIGI = ref['compositeFIGI']
+                    exchCode = ref['exchCode']
+                    figi = ref['figi']
+                    marketSector = ref['marketSector']
+                    name = ref['name']
+                    if "'" in name:
+                        name = name.replace("'", "")
+                    securityDescription = ref['securityDescription']
+                    securityType = ref['securityType']
+                    securityType2 = ref['securityType2']
+                    shareClassFIGI = ref['shareClassFIGI']
+                    ticker = ref['ticker']
+                    value = get_price(ticker)
+
+                    figi_query = f'''INSERT INTO public.figi_ref(cusip, compositeFIGI, figi_exchCode, figi, marketSector, figi_name, securityDescription, securityType, securityType2, shareClassFIGI, ticker, value, insert_date, update_date, insert_by, update_by) values('{i.cusip}' , '{compositeFIGI}' , '{exchCode}' , '{figi}' , '{marketSector}' , '{name}' , '{securityDescription}' , '{securityType}' , '{securityType2}' , '{shareClassFIGI}' , '{ticker}' , {value}, 'nan', 'nan', 'nan', 'nan')'''
+                    cur.execute(figi_query)
+                    query_info_logger.info(f"Query executed -> {figi_query}")
+                    print(f"Query executed -> {figi_query}")
+
+                except Exception as e:
+                    print(e)
+                    query_info_logger.error(f"Invalid cusip related to query -> {query}")
+                    print(f"Invalid cusip related to query -> {query}")
+
+        q = f"""UPDATE public.us_stock_superinvestor SET FLAG = 'Y', cutoff_date = '{select_date}', latest_checked_date = '{today}' WHERE si_cik = '{varCIK}'"""
+        cur.execute(q)
+        db.commit()
+        general_logger.info(f"{varCIK}, {company} Data inserted, Flag set to Y, last date to {str(select_date)}.")
+        print(f"{varCIK}, {company} Data inserted, Flag set to Y, last date to {str(select_date)}.")
+
+if __name__ == '__main__':
+    Log_Format = "%(levelname)s %(asctime)s - %(message)s"
+
+    QUERY_LOGS = "logs/create_investorholding_querys.log"
+    GEN_LOGS = 'logs/create_investorholding.log'
+
+    formatter = logging.Formatter(Log_Format, datefmt="%Y-%m-%d %H:%M:%S")
+
+    query_info_logger = logging.getLogger('URL_Fetcher')
+    hdlr_1 = logging.FileHandler(QUERY_LOGS, mode='w')
+    hdlr_1.setFormatter(formatter)
+    query_info_logger.setLevel(logging.DEBUG)
+    query_info_logger.addHandler(hdlr_1)
+
+    general_logger = logging.getLogger("GENERAL")
+    hdlr_2 = logging.FileHandler(GEN_LOGS, mode='w')
+    hdlr_2.setFormatter(formatter)
+    general_logger.setLevel(logging.DEBUG)
+    general_logger.addHandler(hdlr_2)
+
+    args = sys.argv
+    args = getopt.getopt(sys.argv[1:],shortopts="d:")
+    for opt, arg in args[0]:
+        if opt in ['-d']:
+            select_date = arg 
+
+    db = psycopg2.connect(database=database, user=user, password=password, host=host, port=port)
+
+
+    try:
+        res = True
+        res = bool(datetime.strptime(select_date, '%Y-%m-%d'))
+    except ValueError:
+        res = False
+
+    if res == False:
+        general_logger.error("Invalid Date entered")
+        sys.exit(1)
+
+    cur = db.cursor()
+    general_logger.info(f'Getting Data after {select_date}')
+    print(f'Getting Data after {select_date}')
+    general_logger.info("Connected to cursor.")
+    print("Connected to cursor.")
+    try:
+        insert13f(cur, select_date)
+    except Exception as e:
+        exception_type, exception_object, exception_traceback = sys.exc_info()
+        filename = exception_traceback.tb_frame.f_code.co_filename
+        line_number = exception_traceback.tb_lineno
+
+        general_logger.error(e)
+        dets = "Exception type: " + str(exception_type) + " File name: ", str(filename) + " Line number: " + str(line_number)
+        general_logger.error(dets)
+        sys.exit(2)
+    db.commit()
+    general_logger.info("Insert of all new data completed.")
+    print("Insert of all new data completed.")
+    sys.exit(0)
